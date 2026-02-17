@@ -1,0 +1,11 @@
+# Development and quality tools
+-r requirements.txt
+ruff>=0.6.0
+mypy>=1.11.0
+bandit[toml]>=1.7.8
+black>=24.0.0
+pytest>=8.0.0
+pytest-cov>=4.0.0
+pre-commit>=3.0.0
+types-PyYAML
+types-requests

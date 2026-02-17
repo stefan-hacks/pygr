@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygr"
+version = "0.1.0"
+description = "Python GitHub Repository package manager"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "packaging",
+    "PyYAML",
+    "GitPython",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "bandit[toml]>=1.7.8",
+    "black>=24.0.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+# --- Ruff (linting & formatting) ---
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "C", "UP", "B", "SIM"]
+ignore = ["E501", "C901"]  # line length; main() complexity
+
+[tool.ruff.format]
+quote-style = "double"
+
+# --- Black (formatting, optional if using ruff format) ---
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+# --- mypy ---
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+# --- Bandit (security) ---
+[tool.bandit]
+exclude_dirs = ["tests", "venv", ".venv"]
+skips = [
+    "B101",  # assert_used in tests OK
+    "B404",  # subprocess required for git/build
+    "B602",  # shell=True needed for git ls-remote
+    "B603",  # subprocess for build commands
+    "B202",  # tarfile from trusted cache URL
+]
+
+# --- Pytest ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
