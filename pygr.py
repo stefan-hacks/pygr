@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-pygr - Python GitHub Repository package manager
-Single-file implementation with all advanced features:
-- GitHub source fetching with tree hashing
-- SAT-like dependency resolution with version constraints
-- Sandboxed builds (via firejail)
-- Content-addressed store
-- Binary cache support
-- Transactional profile generations (rollbacks)
-- Install, uninstall, upgrade commands
+pygr - Python GitHub Repository package manager (pdrx-style imperative + declarative)
+
+Use imperatively: search GitHub, install/remove packages from GitHub. Every action
+updates a declarative config (packages.conf) so you can restore with pygr apply.
+
+- Search: pygr search ripgrep  (GitHub API)
+- Install: pygr install owner/repo  or  pygr install recipe_name  (from recipe repos)
+- Remove: pygr remove name  (uninstalls and removes from config)
+- Sync: pygr sync  (write current profile state to declarative config)
+- Apply: pygr apply  (install everything in declarative config)
+- Backup/rollback, export/import, status, generations (like pdrx)
 """
 
 import argparse
@@ -21,7 +23,7 @@ import sqlite3
 import subprocess
 import tarfile
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import git  # requires GitPython
@@ -36,12 +38,17 @@ PROFILE_DIR = os.path.join(PYGR_ROOT, "profiles")
 REPO_CACHE = os.path.join(PYGR_ROOT, "repos")
 DB_PATH = os.path.join(PYGR_ROOT, "pygr.db")
 SOURCE_CACHE = os.path.join(STORE_ROOT, "sources")
+CONFIG_DIR = os.path.join(PYGR_ROOT, "config")
+PACKAGES_CONF = os.path.join(CONFIG_DIR, "packages.conf")
+BACKUPS_DIR = os.path.join(PYGR_ROOT, "backups")
 
 # Ensure directories exist
 os.makedirs(STORE_ROOT, exist_ok=True)
 os.makedirs(PROFILE_DIR, exist_ok=True)
 os.makedirs(REPO_CACHE, exist_ok=True)
 os.makedirs(SOURCE_CACHE, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(BACKUPS_DIR, exist_ok=True)
 
 
 # ==================== Utility Functions ====================
@@ -64,6 +71,113 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+# ==================== Declarative Config (pdrx-style) ====================
+# packages.conf format: one line per package. Lines are either:
+#   github:owner/repo@ref     (install from GitHub; ref = branch, tag, or commit)
+#   recipe:name@version        (install from recipe in added repos)
+# Comments and blank lines are preserved on read; comments written at head.
+
+
+def _parse_packages_line(line: str) -> Optional[Tuple[str, str]]:
+    """Return (kind:spec, display_name) or None for comment/blank."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("github:"):
+        spec = line[7:].strip()
+        # display name = repo name (e.g. owner/repo -> repo)
+        if "@" in spec:
+            repo_part = spec.split("@")[0]
+        else:
+            repo_part = spec
+        name = repo_part.split("/")[-1] if "/" in repo_part else repo_part
+        return (line, name)
+    if line.startswith("recipe:"):
+        spec = line[7:].strip()
+        name = spec.split("@")[0].strip() if "@" in spec else spec.split()[0]
+        return (line, name)
+    return None
+
+
+class DeclarativeConfig:
+    """Read/write declarative packages.conf (updated on install/remove/sync)."""
+
+    def __init__(self, path: str = PACKAGES_CONF):
+        self.path = path
+
+    def read_entries(self) -> List[Tuple[str, str]]:
+        """Return list of (raw_line, display_name)."""
+        if not os.path.isfile(self.path):
+            return []
+        entries = []
+        with open(self.path) as f:
+            for line in f:
+                parsed = _parse_packages_line(line)
+                if parsed:
+                    entries.append(parsed)
+        return entries
+
+    def read_specs(self) -> List[str]:
+        """Return list of spec strings (github:... or recipe:...)."""
+        return [e[0] for e in self.read_entries()]
+
+    def add_entry(self, spec: str) -> None:
+        """Append one line to packages.conf. spec = 'github:owner/repo@ref' or 'recipe:name@ver'."""
+        ensure_dir(os.path.dirname(self.path))
+        header = []
+        if os.path.isfile(self.path):
+            with open(self.path) as f:
+                for line in f:
+                    if line.strip().startswith("#") or not line.strip():
+                        header.append(line.rstrip("\n"))
+                    else:
+                        break
+        existing = set(self.read_specs())
+        if spec in existing:
+            return
+        with open(self.path, "a") as f:
+            if not header and os.path.isfile(self.path) and os.path.getsize(self.path) == 0:
+                f.write(
+                    "# pygr declarative packages\n"
+                    "# Format: github:owner/repo@ref  or  recipe:name@version\n"
+                    "# ADD: pygr install owner/repo or pygr install <recipe>\n"
+                    "# REMOVE: pygr remove <name>\n"
+                    "# RESTORE: pygr apply\n\n"
+                )
+            f.write(spec + "\n")
+
+    def remove_by_name(self, display_name: str) -> bool:
+        """Remove first entry whose display name matches (case-sensitive). Return True if removed."""
+        if not os.path.isfile(self.path):
+            return False
+        with open(self.path) as f:
+            lines = f.readlines()
+        new_lines = []
+        removed = False
+        for line in lines:
+            parsed = _parse_packages_line(line)
+            if parsed and parsed[1] == display_name and not removed:
+                removed = True
+                continue
+            new_lines.append(line)
+        if removed:
+            with open(self.path, "w") as f:
+                f.writelines(new_lines)
+        return removed
+
+    def write_entries(self, specs: List[str]) -> None:
+        """Overwrite packages.conf with these spec lines."""
+        ensure_dir(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            f.write(
+                "# pygr declarative packages\n"
+                "# Format: github:owner/repo@ref  or  recipe:name@version\n"
+                "# RESTORE: pygr apply\n\n"
+            )
+            for s in specs:
+                f.write(s + "\n")
+
+
 def compute_hash(data: Dict[str, Any]) -> str:
     """SHA256 of canonical JSON."""
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
@@ -84,9 +198,14 @@ class Database:
                 name TEXT NOT NULL,
                 version TEXT NOT NULL,
                 store_path TEXT NOT NULL,
+                spec TEXT DEFAULT '',
                 install_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        try:
+            c.execute("ALTER TABLE store_packages ADD COLUMN spec TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column exists
         c.execute("""
             CREATE TABLE IF NOT EXISTS repos (
                 name TEXT PRIMARY KEY,
@@ -108,17 +227,17 @@ class Database:
     def close(self):
         self.conn.close()
 
-    def add_store_package(self, store_id, name, version, store_path):
+    def add_store_package(self, store_id, name, version, store_path, spec=""):
         c = self.conn.cursor()
         c.execute(
-            "INSERT OR IGNORE INTO store_packages (id, name, version, store_path) VALUES (?,?,?,?)",
-            (store_id, name, version, store_path),
+            "INSERT OR REPLACE INTO store_packages (id, name, version, store_path, spec) VALUES (?,?,?,?,?)",
+            (store_id, name, version, store_path, spec),
         )
         self.conn.commit()
 
     def get_store_package(self, store_id):
         c = self.conn.cursor()
-        c.execute("SELECT * FROM store_packages WHERE id=?", (store_id,))
+        c.execute("SELECT id, name, version, store_path, COALESCE(spec,'') FROM store_packages WHERE id=?", (store_id,))
         return c.fetchone()
 
     def add_repo(self, name, url, repo_type="github"):
@@ -257,6 +376,155 @@ class SourceFetcher:
             return cache_path, tree_hash
 
 
+# ==================== GitHub Search ====================
+def github_search(query: str, per_page: int = 10) -> List[Dict[str, Any]]:
+    """Search GitHub repositories. Returns list of dicts with full_name, html_url, description, etc."""
+    url = "https://api.github.com/search/repositories"
+    params = {"q": query, "per_page": per_page, "sort": "stars"}
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("items", [])
+    except requests.RequestException as e:
+        logger(f"GitHub search failed: {e}", "WARNING")
+        return []
+
+
+# ==================== Ad-hoc install from GitHub ====================
+def _resolve_ref(repo_url: str, ref: str) -> str:
+    """Resolve branch/tag to commit hash."""
+    if len(ref) == 40 and ref.isalnum():
+        return ref
+    out = run_cmd(f"git ls-remote {repo_url} {ref}", capture_output=True)
+    commit = (out.stdout or "").split()[0] if out.stdout else None
+    if not commit:
+        raise Exception(f"Could not resolve ref {ref} for {repo_url}")
+    return commit
+
+
+def _adhoc_build_and_install(
+    source_dir: str,
+    store_path: str,
+    repo_name: str,
+    ref: str,
+    use_sandbox: bool,
+) -> None:
+    """Detect build system in source_dir, build, and copy artifacts to store_path."""
+    ensure_dir(store_path)
+    bin_dir = os.path.join(store_path, "bin")
+    ensure_dir(bin_dir)
+    env = os.environ.copy()
+
+    if os.path.isfile(os.path.join(source_dir, "Cargo.toml")):
+        run_cmd("cargo build --release", cwd=source_dir, env=env, check=True)
+        release = os.path.join(source_dir, "target", "release")
+        if os.path.isdir(release):
+            for exe in os.listdir(release):
+                p = os.path.join(release, exe)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    shutil.copy2(p, os.path.join(bin_dir, exe))
+        return
+
+    if os.path.isfile(os.path.join(source_dir, "go.mod")):
+        ensure_dir(bin_dir)
+        run_cmd(f"go build -o {os.path.join(bin_dir, repo_name)} .", cwd=source_dir, env=env, check=True)
+        return
+
+    if os.path.isfile(os.path.join(source_dir, "Makefile")):
+        prefix = os.path.join(source_dir, "install-root")
+        ensure_dir(prefix)
+        run_cmd(f"make PREFIX={prefix} install", cwd=source_dir, env=env, check=True)
+        # Copy install-root/bin/* to store_path/bin
+        src_bin = os.path.join(prefix, "bin")
+        if os.path.isdir(src_bin):
+            for exe in os.listdir(src_bin):
+                shutil.copy2(
+                    os.path.join(src_bin, exe),
+                    os.path.join(bin_dir, exe),
+                )
+        return
+
+    if os.path.isfile(os.path.join(source_dir, "setup.py")) or os.path.isfile(
+        os.path.join(source_dir, "pyproject.toml")
+    ):
+        run_cmd(
+            f"pip install --target {os.path.join(store_path, 'lib')} .",
+            cwd=source_dir,
+            env=env,
+            check=True,
+        )
+        # Create bin wrappers if any console_scripts
+        lib = os.path.join(store_path, "lib")
+        for root, _dirs, files in os.walk(lib):
+            for f in files:
+                if f.endswith(".py") and root == os.path.join(lib, "bin"):
+                    shutil.copy2(os.path.join(root, f), os.path.join(bin_dir, f))
+        return
+
+    logger("No Cargo.toml, Makefile, setup.py, go.mod found; copying repo as-is", "WARNING")
+    # Fallback: copy any executable in root
+    for f in os.listdir(source_dir):
+        p = os.path.join(source_dir, f)
+        if os.path.isfile(p) and os.access(p, os.X_OK) and not f.startswith("."):
+            shutil.copy2(p, os.path.join(bin_dir, f))
+
+
+def install_from_github(
+    owner_repo: str,
+    ref: str = "HEAD",
+    use_sandbox: bool = True,
+    cache_url: Optional[str] = None,
+) -> str:
+    """
+    Install from GitHub owner/repo@ref (ad-hoc: clone + detect build). Returns store_id.
+    Updates store, profile, and declarative config.
+    """
+    if "/" not in owner_repo:
+        raise ValueError("Use owner/repo (e.g. BurntSushi/ripgrep)")
+    owner, repo = owner_repo.split("/", 1)
+    repo = repo.split("@")[0].strip()
+    if "@" in owner_repo:
+        ref = owner_repo.split("@")[-1].strip()
+    repo_url = f"https://github.com/{owner}/{repo}.git"
+    commit = _resolve_ref(repo_url, ref)
+
+    fetcher = SourceFetcher(SOURCE_CACHE)
+    cache_key = f"{owner}_{repo}_{commit}"
+    cache_path = os.path.join(SOURCE_CACHE, cache_key)
+    if not os.path.exists(cache_path):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            r = git.Repo.clone_from(repo_url, tmpdir, depth=1, no_checkout=True)
+            r.git.fetch("--depth=1", "origin", commit)
+            r.git.checkout(commit)
+            shutil.copytree(tmpdir, cache_path)
+
+    store = Store()
+    store_hash = hashlib.sha256(f"github:{owner}/{repo}@{commit}".encode()).hexdigest()[:16]
+    store_id = store_hash
+    store_path = os.path.join(store.root, f"{store_id}-{repo}-{ref}")
+    if os.path.exists(store_path):
+        logger(f"Already installed: {repo}")
+    else:
+        _adhoc_build_and_install(cache_path, store_path, repo, ref, use_sandbox)
+        spec = f"github:{owner}/{repo}@{commit}"
+        store.db.add_store_package(store_id, repo, ref, store_path, spec)
+
+    profile = Profile()
+    gen, pkgs = profile.current_generation()
+    if store_id not in pkgs:
+        new_pkgs = list(pkgs) + [store_id]
+        profile.add_generation(new_pkgs)
+    spec = f"github:{owner}/{repo}@{commit}"
+    DeclarativeConfig().add_entry(spec)
+    logger(f"Installed {repo} (github:{owner}/{repo}@{commit})")
+    return store_id
+
+
 # ==================== Store ====================
 class Store:
     def __init__(self, store_root=STORE_ROOT):
@@ -272,16 +540,17 @@ class Store:
         }
         return compute_hash(data)
 
-    def add_package(self, recipe, source_hash, dep_hashes, build_output_dir):
+    def add_package(self, recipe, source_hash, dep_hashes, build_output_dir, spec=None):
         store_hash = self.compute_derivation_hash(recipe, source_hash, dep_hashes)
         store_path = os.path.join(self.root, f"{store_hash}-{recipe.name}-{recipe.version}")
         if os.path.exists(store_path):
             logger(f"Package already exists in store: {store_path}")
             return store_path
-
+        if spec is None:
+            spec = f"recipe:{recipe.name}@{recipe.version}"
         logger(f"Installing to store: {store_path}")
         shutil.copytree(build_output_dir, store_path)
-        self.db.add_store_package(store_hash, recipe.name, recipe.version, store_path)
+        self.db.add_store_package(store_hash, recipe.name, recipe.version, store_path, spec)
         return store_path
 
     def get_package_path(self, store_hash):
@@ -623,7 +892,11 @@ class Transaction:
                 if self.cache.fetch(store_hash, cache_path):
                     store_path = cache_path
                     self.store.db.add_store_package(
-                        store_hash, recipe.name, recipe.version, store_path
+                        store_hash,
+                        recipe.name,
+                        recipe.version,
+                        store_path,
+                        f"recipe:{recipe.name}@{recipe.version}",
                     )
                 else:
                     logger(f"Building {recipe.name}-{recipe.version}")
@@ -637,6 +910,9 @@ class Transaction:
         current_gen, current_pkgs = self.profile.current_generation()
         new_pkgs = list(set(current_pkgs) | set(built_store_ids))
         self.profile.add_generation(new_pkgs)
+        cfg = DeclarativeConfig()
+        for r in all_recipes:
+            cfg.add_entry(f"recipe:{r.name}@{r.version}")
         logger("Installation complete. New profile generation created.")
 
     def uninstall(self, package_names):
@@ -655,6 +931,9 @@ class Transaction:
         new_pkgs = [p for p in current_pkgs if p not in to_remove]
         if new_pkgs != current_pkgs:
             self.profile.add_generation(new_pkgs)
+            cfg = DeclarativeConfig()
+            for name in package_names:
+                cfg.remove_by_name(name)
             logger(f"Uninstalled {', '.join(package_names)}. New generation created.")
         else:
             logger("No packages removed.")
@@ -679,9 +958,130 @@ class Transaction:
         self.install(package_names)
 
 
+# ==================== Sync / Apply / Status / Backup (pdrx-style) ====================
+def cmd_sync() -> None:
+    """Write current profile state to declarative packages.conf."""
+    profile = Profile()
+    gen, store_ids = profile.current_generation()
+    store = Store()
+    specs = []
+    for sid in store_ids:
+        row = store.db.get_store_package(sid)
+        if row:
+            spec = row[4] if len(row) > 4 else ""
+            if not spec:
+                spec = f"recipe:{row[1]}@{row[2]}"
+            specs.append(spec)
+    DeclarativeConfig().write_entries(specs)
+    logger(f"Synced generation {gen} ({len(specs)} packages) to {PACKAGES_CONF}")
+
+
+def cmd_apply(use_sandbox: bool = True, cache_url: Optional[str] = None) -> None:
+    """Install all packages from declarative config."""
+    cfg = DeclarativeConfig()
+    specs = cfg.read_specs()
+    if not specs:
+        logger("No packages in config. Add with pygr install or edit packages.conf.")
+        return
+    trans = Transaction(use_sandbox=use_sandbox, cache_url=cache_url)
+    github_specs = []
+    recipe_specs = []
+    for s in specs:
+        if s.startswith("github:"):
+            github_specs.append(s)
+        elif s.startswith("recipe:"):
+            recipe_specs.append(s)
+    for spec in github_specs:
+        part = spec[7:].strip()  # github:
+        if "@" in part:
+            repo_ref = part.split("@", 1)
+            owner_repo = repo_ref[0].strip()
+            ref = repo_ref[1].strip()
+            install_from_github(owner_repo, ref=ref, use_sandbox=use_sandbox, cache_url=cache_url)
+        else:
+            install_from_github(part, use_sandbox=use_sandbox, cache_url=cache_url)
+    if recipe_specs:
+        specs_for_install = []
+        for s in recipe_specs:
+            part = s[7:].strip()
+            if "@" in part:
+                name, ver = part.split("@", 1)
+                specs_for_install.append(f"{name.strip()}=={ver.strip()}")
+            else:
+                specs_for_install.append(part)
+        trans.install(specs_for_install)
+
+
+def cmd_status() -> None:
+    """Show config path, package count, backups."""
+    cfg = DeclarativeConfig()
+    entries = cfg.read_entries()
+    profile = Profile()
+    gen, pkgs = profile.current_generation()
+    backups = sorted([d for d in os.listdir(BACKUPS_DIR) if os.path.isdir(os.path.join(BACKUPS_DIR, d))])
+    print(f"Config:     {PACKAGES_CONF}")
+    print(f"Packages:   {len(entries)} in config  |  {len(pkgs)} in current profile (gen {gen})")
+    print(f"Backups:    {len(backups)}")
+
+
+def cmd_backup(label: str = "") -> str:
+    """Create timestamped backup of config. Returns path."""
+    from datetime import datetime
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    name = f"{ts}_manual" if not label else f"{ts}_{label}"
+    dest = os.path.join(BACKUPS_DIR, name)
+    ensure_dir(dest)
+    for item in ["config"]:
+        src = os.path.join(PYGR_ROOT, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(dest, item), dirs_exist_ok=True)
+    logger(f"Backup: {dest}")
+    return dest
+
+
+def cmd_generations() -> None:
+    """List profile generations and backup dirs."""
+    profile = Profile()
+    gen, _ = profile.current_generation()
+    c = profile.db.conn.cursor()
+    c.execute("SELECT generation FROM profiles WHERE name=? ORDER BY generation", (profile.name,))
+    gens = [row[0] for row in c.fetchall()]
+    print("Profile generations (current = *):")
+    for g in gens:
+        print(f"  {g}" + (" *" if g == gen else ""))
+    backups = sorted([d for d in os.listdir(BACKUPS_DIR) if os.path.isdir(os.path.join(BACKUPS_DIR, d))])
+    if backups:
+        print("Backups:")
+        for b in backups:
+            print(f"  {b}")
+
+
+def cmd_export(path: str = "") -> None:
+    """Export config to tarball."""
+    from datetime import datetime
+
+    out = path or f"pygr-export-{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.tar.gz"
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(CONFIG_DIR, arcname="config")
+    logger(f"Exported to {out}")
+
+
+def cmd_import(archive: str) -> None:
+    """Import config from tarball."""
+    with tarfile.open(archive, "r:*") as tar:
+        tar.extractall(path=PYGR_ROOT)
+    logger(f"Imported from {archive}. Run pygr apply to install.")
+
+
 # ==================== CLI ====================
 def main():
-    parser = argparse.ArgumentParser(description="pygr - Python GitHub Repository package manager")
+    parser = argparse.ArgumentParser(
+        description="pygr - Python GitHub Repository package manager (imperative + declarative)"
+    )
+    parser.add_argument(
+        "-c", "--config", dest="config_dir", metavar="DIR", help="Use DIR as PYGR_ROOT"
+    )
     parser.add_argument(
         "--sandbox",
         action="store_true",
@@ -702,16 +1102,40 @@ def main():
     # repo-list
     subparsers.add_parser("repo-list", help="List added repositories")
 
-    # install
-    install = subparsers.add_parser("install", help="Install packages")
-    install.add_argument("packages", nargs="+")
+    # search (GitHub)
+    search_p = subparsers.add_parser("search", help="Search GitHub for repositories")
+    search_p.add_argument("query", help="Search query (e.g. ripgrep, cowsay)")
+    search_p.add_argument("-n", "--num", type=int, default=10, help="Max results (default 10)")
+
+    # install (recipe name or owner/repo)
+    install = subparsers.add_parser(
+        "install",
+        help="Install packages (recipe name or owner/repo from GitHub)",
+    )
+    install.add_argument(
+        "packages",
+        nargs="+",
+        help="Recipe name(s) or owner/repo (e.g. BurntSushi/ripgrep)",
+    )
 
     # list
     subparsers.add_parser("list", help="List installed packages")
 
     # uninstall
-    uninstall = subparsers.add_parser("uninstall", help="Remove packages")
+    uninstall = subparsers.add_parser("uninstall", help="Remove packages (updates declarative config)")
     uninstall.add_argument("packages", nargs="+")
+
+    # sync / apply / status / backup / generations / export / import
+    subparsers.add_parser("sync", help="Write current profile state to declarative config")
+    subparsers.add_parser("apply", help="Install all packages from declarative config")
+    subparsers.add_parser("status", help="Show config path, package count, backups")
+    backup_p = subparsers.add_parser("backup", help="Create timestamped backup of config")
+    backup_p.add_argument("label", nargs="?", default="", help="Optional backup label")
+    subparsers.add_parser("generations", help="List profile generations and backups")
+    export_p = subparsers.add_parser("export", help="Export config to tarball")
+    export_p.add_argument("file", nargs="?", default="", help="Output path")
+    import_p = subparsers.add_parser("import", help="Import config from tarball")
+    import_p.add_argument("file", help="Tarball path")
 
     # upgrade
     upgrade = subparsers.add_parser("upgrade", help="Upgrade packages")
@@ -721,6 +1145,21 @@ def main():
     subparsers.add_parser("rollback", help="Rollback to previous generation")
 
     args = parser.parse_args()
+    if getattr(args, "config_dir", None):
+        _root = os.path.abspath(args.config_dir)
+        os.environ["PYGR_ROOT"] = _root
+        # Update module-level paths so -c takes effect
+        global PYGR_ROOT, STORE_ROOT, PROFILE_DIR, REPO_CACHE, DB_PATH, SOURCE_CACHE
+        global CONFIG_DIR, PACKAGES_CONF, BACKUPS_DIR
+        PYGR_ROOT = _root
+        STORE_ROOT = os.path.join(PYGR_ROOT, "store")
+        PROFILE_DIR = os.path.join(PYGR_ROOT, "profiles")
+        REPO_CACHE = os.path.join(PYGR_ROOT, "repos")
+        DB_PATH = os.path.join(PYGR_ROOT, "pygr.db")
+        SOURCE_CACHE = os.path.join(STORE_ROOT, "sources")
+        CONFIG_DIR = os.path.join(PYGR_ROOT, "config")
+        PACKAGES_CONF = os.path.join(CONFIG_DIR, "packages.conf")
+        BACKUPS_DIR = os.path.join(PYGR_ROOT, "backups")
     cache_url = args.cache or os.environ.get("PYGR_CACHE_URL")
 
     if args.command == "repo-add":
@@ -733,9 +1172,24 @@ def main():
         db.close()
         for name, url in repos:
             print(f"{name}: {url}")
+    elif args.command == "search":
+        items = github_search(args.query, per_page=args.num)
+        for i, repo in enumerate(items, 1):
+            full = repo.get("full_name", "")
+            desc = (repo.get("description") or "")[:60]
+            url = repo.get("html_url", "")
+            print(f"{i}. {full}  {desc}")
+            print(f"   {url}")
+        if not items:
+            print("No results. Try GITHUB_TOKEN for higher rate limit.")
     elif args.command == "install":
         trans = Transaction(use_sandbox=args.sandbox, cache_url=cache_url)
-        trans.install(args.packages)
+        github_pkgs = [p for p in args.packages if "/" in p.split("@")[0]]
+        recipe_pkgs = [p for p in args.packages if p not in github_pkgs]
+        for p in github_pkgs:
+            install_from_github(p, use_sandbox=args.sandbox, cache_url=cache_url)
+        if recipe_pkgs:
+            trans.install(recipe_pkgs)
     elif args.command == "list":
         profile = Profile()
         gen, pkgs = profile.current_generation()
@@ -763,6 +1217,20 @@ def main():
             return
         profile.switch_to_generation(gen - 1)
         print(f"Rolled back to generation {gen - 1}")
+    elif args.command == "sync":
+        cmd_sync()
+    elif args.command == "apply":
+        cmd_apply(use_sandbox=args.sandbox, cache_url=cache_url)
+    elif args.command == "status":
+        cmd_status()
+    elif args.command == "backup":
+        cmd_backup(getattr(args, "label", "") or "")
+    elif args.command == "generations":
+        cmd_generations()
+    elif args.command == "export":
+        cmd_export(getattr(args, "file", "") or "")
+    elif args.command == "import":
+        cmd_import(args.file)
 
 
 if __name__ == "__main__":

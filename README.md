@@ -4,17 +4,18 @@
 
 # pygr — Python GitHub Repository package manager
 
-**pygr** is a single-file package manager that builds and installs software from GitHub repositories using declarative YAML recipes. It provides content-addressed builds, SAT-like dependency resolution with version constraints, optional sandboxed builds (firejail), binary cache support, and transactional profile generations (rollback).
+**pygr** is a [pdrx](https://github.com/stefan-hacks/pdrx)-style package manager: use it **imperatively** (search GitHub, install/remove packages), and it **automatically updates a declarative config** so you can restore your setup with `pygr apply`. Everything is installed **from GitHub** (recipes or direct `owner/repo`).
 
 ## Features
 
-- **GitHub source fetching** with tree hashing for reproducible builds
-- **Dependency resolution** with version constraints (`>=`, `==`, `<`, etc.)
-- **Sandboxed builds** via [firejail](https://firejail.wordpress.com/) (optional)
-- **Content-addressed store** so identical builds are deduplicated
-- **Binary cache** support to download pre-built artifacts
-- **Transactional profiles** — install/upgrade creates a new generation; `pygr rollback` reverts to the previous one
-- **Commands:** `repo-add`, `repo-list`, `install`, `list`, `uninstall`, `upgrade`, `rollback`
+- **Imperative + declarative** — Install/remove as usual; `config/packages.conf` is updated automatically. Restore with `pygr apply`.
+- **Search GitHub** — `pygr search ripgrep` finds any repository on GitHub (API).
+- **Install from GitHub** — By recipe name (from repos you add) or by `owner/repo` (ad-hoc: clone + detect Cargo/Makefile/setup.py/go.mod and build).
+- **Reproducible** — Declarative file records `github:owner/repo@ref` or `recipe:name@version` for exact replay.
+- **Sync / Apply** — `pygr sync` writes current profile to config; `pygr apply` installs everything in config.
+- **Backup / Rollback** — Timestamped backups, profile generations, `pygr rollback`, `pygr export` / `pygr import`.
+- **Content-addressed store**, optional **sandbox** (firejail), **binary cache**, **dependency resolution** (recipes).
+- **Commands:** `search`, `install`, `remove` (as `uninstall`), `list`, `sync`, `apply`, `status`, `backup`, `generations`, `export`, `import`, `repo-add`, `repo-list`, `upgrade`, `rollback`
 
 ## Requirements
 
@@ -133,66 +134,75 @@ sudo cp dist/pygr /usr/local/bin/
 
 ## Usage
 
-### Add a recipe repository
+### Search GitHub
 
-Recipes are YAML files in a Git repository. Add a repo that contains them:
+Search for any tool on GitHub (uses GitHub API; set `GITHUB_TOKEN` for higher rate limits):
 
 ```bash
-pygr repo-add myrecipes https://github.com/me/my-pygr-recipes
-pygr repo-list
+pygr search ripgrep
+pygr search cowsay -n 5
 ```
 
 ### Install packages
 
-```bash
-# Install one or more packages (by name from your added repos)
-pygr install cowsay
-pygr install cowsay hello
+Install by **recipe name** (from repos you added) or by **owner/repo** (direct from GitHub; build is auto-detected):
 
-# Version constraints (optional)
+```bash
+# From a recipe (add recipe repos first with repo-add)
+pygr repo-add myrecipes https://github.com/me/my-pygr-recipes
+pygr install cowsay
 pygr install "mytool>=1.2"
-pygr install "mytool==2.0"
+
+# Direct from GitHub (clone + build; Cargo.toml, Makefile, setup.py, go.mod supported)
+pygr install BurntSushi/ripgrep
+pygr install owner/repo@v1.0
 ```
 
-### List installed packages
+Every install updates the declarative config (`config/packages.conf`).
+
+### List / Remove
 
 ```bash
 pygr list
+pygr uninstall cowsay    # uninstalls and removes from config
+pygr uninstall ripgrep
 ```
 
-### Uninstall
+### Sync and Apply (declarative)
+
+- **sync** — Write current profile state to `config/packages.conf`.
+- **apply** — Install every package in the declarative config (restore setup).
 
 ```bash
-pygr uninstall cowsay
-pygr uninstall cowsay hello
+pygr sync              # capture current installs into config
+pygr apply             # install all from config (e.g. on a new machine)
+```
+
+### Status, Backup, Generations, Export/Import
+
+```bash
+pygr status            # config path, package count, backups
+pygr backup            # timestamped backup of config
+pygr backup my-label   # backup with label
+pygr generations       # list profile generations and backups
+pygr rollback          # switch to previous generation
+pygr export            # tarball of config
+pygr export my.tgz
+pygr import my.tgz     # extract config; then pygr apply
 ```
 
 ### Upgrade
 
 ```bash
-pygr upgrade cowsay    # upgrade one package
-pygr upgrade           # upgrade all installed packages
+pygr upgrade cowsay
+pygr upgrade           # upgrade all installed
 ```
 
-### Rollback
+### Config directory and sandbox
 
-If an install or upgrade causes issues, switch back to the previous profile generation:
-
-```bash
-pygr rollback
-```
-
-### Sandbox and binary cache
-
-- **Disable sandbox** (e.g. if firejail is not installed):  
-  `pygr --no-sandbox install cowsay`
-
-- **Binary cache** (optional): set a base URL so pygr can download pre-built artifacts instead of building:
-  ```bash
-  export PYGR_CACHE_URL=https://my-cache.example.com/pygr
-  pygr install cowsay
-  ```
-  Or: `pygr --cache https://my-cache.example.com/pygr install cowsay`
+- Use another config root: `pygr -c /path/to/pygr-root install cowsay`
+- **Sandbox** (firejail): `pygr --no-sandbox install ...` to disable
+- **Binary cache**: `export PYGR_CACHE_URL=https://...` or `pygr --cache https://... install ...`
 
 ---
 
@@ -235,13 +245,26 @@ dependencies:
 
 ## Data locations
 
-- **Root:** `~/.local/share/pygr` (override with environment variable `PYGR_ROOT`)
+- **Root:** `~/.local/share/pygr` (override with `PYGR_ROOT` or `-c DIR`)
+- **Config:** `$PYGR_ROOT/config/packages.conf` — declarative list (updated on install/remove/sync)
+- **Backups:** `$PYGR_ROOT/backups/` — timestamped backup dirs
 - **Store:** `$PYGR_ROOT/store`
 - **Profiles:** `$PYGR_ROOT/profiles`
 - **Repo cache:** `$PYGR_ROOT/repos`
 - **Database:** `$PYGR_ROOT/pygr.db`
 
-Installed binaries are symlinked into the active profile’s `bin` directory; add that directory to your `PATH` if you want to run them directly (see your profile path under `$PYGR_ROOT/profiles`).
+Installed binaries are symlinked into the active profile’s `bin` directory; add that directory to your `PATH` to run them.
+
+### Declarative config format
+
+`config/packages.conf` has one line per package:
+
+- `github:owner/repo@ref` — installed from GitHub (ref = branch, tag, or commit)
+- `recipe:name@version` — installed from a recipe in an added repo
+
+**Add:** `pygr install owner/repo` or `pygr install recipe_name`  
+**Remove:** `pygr uninstall name`  
+**Restore:** `pygr apply`
 
 ---
 
