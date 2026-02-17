@@ -158,7 +158,7 @@ pygr install BurntSushi/ripgrep
 pygr install owner/repo@v1.0
 ```
 
-Every install updates the declarative config (`config/packages.conf`).
+Every install updates the declarative config (`config/packages.conf`). After installing, add the profile bin to your PATH (see [Data locations](#data-locations)) so you can run the tools — e.g. `eval $(pygr path)` then `ripgrep` or `cowsay`.
 
 ### List / Remove
 
@@ -253,7 +253,17 @@ dependencies:
 - **Repo cache:** `$PYGR_ROOT/repos`
 - **Database:** `$PYGR_ROOT/pygr.db`
 
-Installed binaries are symlinked into the active profile’s `bin` directory; add that directory to your `PATH` to run them.
+**Using installed tools:** Executables are in the profile’s `bin` directory. Add it to your `PATH`:
+
+```bash
+# One-time (current shell)
+eval $(pygr path)
+
+# Or manually
+export PATH="$HOME/.local/share/pygr/profiles/default/bin:$PATH"
+```
+
+To make it permanent, add one of the above to your `~/.bashrc` or `~/.profile`. Then run `ripgrep`, `cowsay`, etc. as usual. You can also run `pygr path` to see the exact export line.
 
 ### Declarative config format
 

@@ -522,6 +522,7 @@ def install_from_github(
     spec = f"github:{owner}/{repo}@{commit}"
     DeclarativeConfig().add_entry(spec)
     logger(f"Installed {repo} (github:{owner}/{repo}@{commit})")
+    _print_path_hint()
     return store_id
 
 
@@ -914,6 +915,7 @@ class Transaction:
         for r in all_recipes:
             cfg.add_entry(f"recipe:{r.name}@{r.version}")
         logger("Installation complete. New profile generation created.")
+        _print_path_hint()
 
     def uninstall(self, package_names):
         current_gen, current_pkgs = self.profile.current_generation()
@@ -956,6 +958,23 @@ class Transaction:
                         names.add(name)
             package_names = list(names)
         self.install(package_names)
+
+
+def _profile_bin_dir(profile_name: str = "default") -> str:
+    """Return the profile's bin directory where executables are symlinked."""
+    return os.path.join(PROFILE_DIR, profile_name, "bin")
+
+
+def _print_path_hint() -> None:
+    """Print how to add installed tools to PATH."""
+    bin_dir = _profile_bin_dir()
+    if not os.path.isdir(bin_dir):
+        return
+    print()
+    print("To use installed tools, add the profile bin to your PATH:")
+    print(f"  export PATH=\"{bin_dir}:$PATH\"")
+    print("Or run:  eval $(pygr path)")
+    print("Add the above to ~/.bashrc or ~/.profile to make it permanent.")
 
 
 # ==================== Sync / Apply / Status / Backup (pdrx-style) ====================
@@ -1121,6 +1140,12 @@ def main():
     # list
     subparsers.add_parser("list", help="List installed packages")
 
+    # path (print export for profile bin)
+    subparsers.add_parser(
+        "path",
+        help="Print shell export to add profile bin to PATH (use: eval $(pygr path))",
+    )
+
     # uninstall
     uninstall = subparsers.add_parser("uninstall", help="Remove packages (updates declarative config)")
     uninstall.add_argument("packages", nargs="+")
@@ -1203,6 +1228,9 @@ def main():
             if path:
                 name_ver = os.path.basename(path).split("-", 1)[1]
                 print(f"  {name_ver}")
+    elif args.command == "path":
+        bin_dir = _profile_bin_dir()
+        print(f"export PATH=\"{bin_dir}:$PATH\"")
     elif args.command == "uninstall":
         trans = Transaction(use_sandbox=args.sandbox)
         trans.uninstall(args.packages)
