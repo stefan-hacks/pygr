@@ -31,16 +31,39 @@ PYGR_REPO=https://.../pygr/main ./install-pygr.sh   # custom repo URL for pygr.p
 
 ## How to use pygr
 
-### Global options (before the command)
+### Options reference (all options at a glance)
+
+**Global options** (must appear before the command):
 
 | Option | Description |
 |--------|-------------|
-| `-c DIR`, `--config DIR` | Use `DIR` as config root (instead of `~/.local/share/pygr`). |
+| `-c DIR`, `--config DIR` | Use `DIR` as config root (default: `~/.local/share/pygr`). |
 | `--sandbox` | Use firejail for build isolation (default). |
-| `--no-sandbox` | Disable sandbox (e.g. if firejail is not installed). |
+| `--no-sandbox` | Disable sandbox. |
 | `--cache URL` | Binary cache base URL (or set `PYGR_CACHE_URL`). |
 
-Examples:
+**Commands and their options:**
+
+| Command | Arguments | Options | Description |
+|---------|-----------|---------|-------------|
+| `search` | `QUERY` | `-n N`, `--num N` (default: 10) | Search GitHub for repositories. |
+| `install` | `PACKAGE [PACKAGE ...]` | `--from-github` | Install by name (distro → recipe → GitHub) or `owner/repo`. |
+| `uninstall` | `PACKAGE [PACKAGE ...]` | — | Remove packages and from config. |
+| `list` | — | — | List packages in config (distro ones marked). |
+| `path` | — | — | Print `export PATH=...` for profile bin. |
+| `sync` | — | — | Write current profile to declarative config. |
+| `apply` | — | — | Install all packages from config. |
+| `status` | — | — | Show config path, package counts, backups. |
+| `backup` | `[LABEL]` | — | Create timestamped backup (optional label). |
+| `generations` | — | — | List profile generations and backups. |
+| `rollback` | — | — | Switch to previous generation. |
+| `export` | `[FILE]` | — | Export config to tarball. |
+| `import` | `FILE` | — | Import config from tarball. |
+| `upgrade` | `[PACKAGE ...]` | — | Upgrade named packages or all. |
+| `repo-add` | `NAME` `URL` | — | Add a recipe repository. |
+| `repo-list` | — | — | List added repositories. |
+
+**Examples (global options):**
 
 ```bash
 pygr -c /opt/my-pygr install ripgrep
