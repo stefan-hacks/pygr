@@ -71,10 +71,150 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+# ==================== Distro package manager (prefer official repo) ====================
+def _detect_distro() -> Optional[Tuple[str, str, str, str]]:
+    """Return (pm_key, install_cmd, search_cmd, remove_cmd) or None. pm_key e.g. apt, dnf, pacman, zypper, apk."""
+    os_release = "/etc/os-release"
+    if not os.path.isfile(os_release):
+        return None
+    env: Dict[str, str] = {}
+    with open(os_release) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k] = v.strip('"').strip("'")
+    id_like = (env.get("ID_LIKE") or "").split()
+    id_ = env.get("ID", "").lower()
+    if id_ in ("debian", "ubuntu", "linuxmint", "pop") or "debian" in id_like:
+        return ("apt", "sudo apt-get install -y", "apt-cache search --names-only ^", "sudo apt-get remove -y")
+    if id_ in ("fedora", "rhel", "centos", "rocky", "alma") or "fedora" in id_like or "rhel" in id_like:
+        return ("dnf", "sudo dnf install -y", "dnf list available", "sudo dnf remove -y")
+    if id_ in ("arch", "manjaro") or "arch" in id_like:
+        return ("pacman", "sudo pacman -S --noconfirm", "pacman -Ss", "sudo pacman -R --noconfirm")
+    if id_ in ("opensuse-leap", "opensuse-tumbleweed", "sles") or "suse" in id_like:
+        return ("zypper", "sudo zypper install -y", "zypper search", "sudo zypper remove -y")
+    if id_ == "alpine":
+        return ("apk", "sudo apk add", "apk search", "sudo apk del")
+    return None
+
+
+def distro_package_available(pm_key: str, name: str) -> bool:
+    """Check if a package is available in the distro (without installing)."""
+    try:
+        if pm_key == "apt":
+            r = subprocess.run(
+                f"apt-cache show {name}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0 and bool(r.stdout.strip())
+        if pm_key == "dnf":
+            r = subprocess.run(
+                f"dnf list available {name}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return r.returncode == 0 and name in (r.stdout or "")
+        if pm_key == "pacman":
+            r = subprocess.run(
+                f"pacman -Ss ^{name}$",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0 and bool((r.stdout or "").strip())
+        if pm_key == "zypper":
+            r = subprocess.run(
+                f"zypper search -n {name}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return r.returncode == 0 and name in (r.stdout or "")
+        if pm_key == "apk":
+            r = subprocess.run(
+                f"apk search -e {name}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0 and name in (r.stdout or "")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return False
+
+
+def distro_install(pm_key: str, name: str) -> bool:
+    """Install package via distro PM. Returns True on success."""
+    info = _detect_distro()
+    if not info or info[0] != pm_key:
+        return False
+    _pm, install_cmd, _s, _r = info
+    try:
+        subprocess.run(f"{install_cmd} {name}", shell=True, check=True, timeout=300)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def distro_remove(pm_key: str, name: str) -> bool:
+    """Remove package via distro PM. Returns True on success."""
+    info = _detect_distro()
+    if not info or info[0] != pm_key:
+        return False
+    _pm, _i, _s, remove_cmd = info
+    try:
+        subprocess.run(f"{remove_cmd} {name}", shell=True, check=True, timeout=120)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def _install_simple_name_from_github(
+    name: str, use_sandbox: bool = True, cache_url: Optional[str] = None
+) -> None:
+    """Search GitHub for name and install the first (best) result."""
+    items = github_search(name, per_page=5)
+    if not items:
+        raise SystemExit(f"No GitHub repo found for '{name}'. Try: pygr search {name}")
+    best = items[0]
+    full_name = best.get("full_name", "")
+    if "/" in full_name:
+        install_from_github(full_name, use_sandbox=use_sandbox, cache_url=cache_url)
+    else:
+        raise SystemExit(f"No GitHub repo found for '{name}'.")
+
+
+def try_install_from_distro(name: str) -> Optional[str]:
+    """
+    If current distro has a package for name, install it and return spec (e.g. distro:apt:name).
+    Otherwise return None.
+    """
+    info = _detect_distro()
+    if not info:
+        return None
+    pm_key, _i, _s, _r = info
+    if not distro_package_available(pm_key, name):
+        return None
+    logger(f"Using {pm_key} package for {name} (compatible with your distribution)")
+    if distro_install(pm_key, name):
+        return f"distro:{pm_key}:{name}"
+    return None
+
+
 # ==================== Declarative Config (pdrx-style) ====================
 # packages.conf format: one line per package. Lines are either:
+#   distro:pm:name            (installed via system package manager)
 #   github:owner/repo@ref     (install from GitHub; ref = branch, tag, or commit)
-#   recipe:name@version        (install from recipe in added repos)
+#   recipe:name@version       (install from recipe in added repos)
 # Comments and blank lines are preserved on read; comments written at head.
 
 
@@ -83,9 +223,14 @@ def _parse_packages_line(line: str) -> Optional[Tuple[str, str]]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
+    if line.startswith("distro:"):
+        # distro:apt:ripgrep -> display name ripgrep
+        parts = line[7:].strip().split(":", 1)
+        if len(parts) == 2:
+            return (line, parts[1].strip())
+        return (line, line[7:].strip())
     if line.startswith("github:"):
         spec = line[7:].strip()
-        # display name = repo name (e.g. owner/repo -> repo)
         if "@" in spec:
             repo_part = spec.split("@")[0]
         else:
@@ -139,31 +284,31 @@ class DeclarativeConfig:
             if not header and os.path.isfile(self.path) and os.path.getsize(self.path) == 0:
                 f.write(
                     "# pygr declarative packages\n"
-                    "# Format: github:owner/repo@ref  or  recipe:name@version\n"
-                    "# ADD: pygr install owner/repo or pygr install <recipe>\n"
+                    "# Format: distro:pm:name | github:owner/repo@ref | recipe:name@version\n"
+                    "# ADD: pygr install <name> (tries distro then recipe then GitHub)\n"
                     "# REMOVE: pygr remove <name>\n"
                     "# RESTORE: pygr apply\n\n"
                 )
             f.write(spec + "\n")
 
-    def remove_by_name(self, display_name: str) -> bool:
-        """Remove first entry whose display name matches (case-sensitive). Return True if removed."""
+    def remove_by_name(self, display_name: str) -> Optional[str]:
+        """Remove first entry whose display name matches. Return the removed spec line or None."""
         if not os.path.isfile(self.path):
-            return False
+            return None
         with open(self.path) as f:
             lines = f.readlines()
         new_lines = []
-        removed = False
+        removed_spec = None
         for line in lines:
             parsed = _parse_packages_line(line)
-            if parsed and parsed[1] == display_name and not removed:
-                removed = True
+            if parsed and parsed[1] == display_name and removed_spec is None:
+                removed_spec = parsed[0]
                 continue
             new_lines.append(line)
-        if removed:
+        if removed_spec is not None:
             with open(self.path, "w") as f:
                 f.writelines(new_lines)
-        return removed
+        return removed_spec
 
     def write_entries(self, specs: List[str]) -> None:
         """Overwrite packages.conf with these spec lines."""
@@ -171,7 +316,7 @@ class DeclarativeConfig:
         with open(self.path, "w") as f:
             f.write(
                 "# pygr declarative packages\n"
-                "# Format: github:owner/repo@ref  or  recipe:name@version\n"
+                "# Format: distro:pm:name | github:owner/repo@ref | recipe:name@version\n"
                 "# RESTORE: pygr apply\n\n"
             )
             for s in specs:
@@ -414,12 +559,15 @@ def _adhoc_build_and_install(
     ref: str,
     use_sandbox: bool,
 ) -> None:
-    """Detect build system in source_dir, build, and copy artifacts to store_path."""
+    """Detect build system in source_dir, build, and copy artifacts to store_path.
+    Supports: Rust (Cargo), Go, Node.js, Python, CMake, Meson, Makefile, Ruby, Gradle, Maven, Just.
+    """
     ensure_dir(store_path)
     bin_dir = os.path.join(store_path, "bin")
     ensure_dir(bin_dir)
     env = os.environ.copy()
 
+    # --- Rust ---
     if os.path.isfile(os.path.join(source_dir, "Cargo.toml")):
         run_cmd("cargo build --release", cwd=source_dir, env=env, check=True)
         release = os.path.join(source_dir, "target", "release")
@@ -430,25 +578,159 @@ def _adhoc_build_and_install(
                     shutil.copy2(p, os.path.join(bin_dir, exe))
         return
 
+    # --- Go ---
     if os.path.isfile(os.path.join(source_dir, "go.mod")):
-        ensure_dir(bin_dir)
         run_cmd(f"go build -o {os.path.join(bin_dir, repo_name)} .", cwd=source_dir, env=env, check=True)
         return
 
+    # --- Node.js (before Python: some repos have both) ---
+
+    if os.path.isfile(os.path.join(source_dir, "package.json")):
+        # Node.js: npm install, copy project to store, create bin wrappers from package.json "bin"
+        run_cmd("npm install --production", cwd=source_dir, env=env, check=True)
+        # Copy full project into store_path (package root = store_path)
+        for item in os.listdir(source_dir):
+            src = os.path.join(source_dir, item)
+            dst = os.path.join(store_path, item)
+            if item == "bin":
+                continue
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        pkg_path = os.path.join(store_path, "package.json")
+        with open(pkg_path) as f:
+            pkg = json.load(f)
+        bin_map = pkg.get("bin")
+        if isinstance(bin_map, str):
+            bin_map = {pkg.get("name", repo_name): bin_map}
+        if not isinstance(bin_map, dict):
+            bin_map = {}
+        for cmd_name, rel_script in bin_map.items():
+            if not rel_script:
+                continue
+            script_path = os.path.normpath(os.path.join(store_path, rel_script))
+            if not os.path.isfile(script_path):
+                continue
+            rel_from_bin = os.path.relpath(script_path, bin_dir)
+            wrapper = os.path.join(bin_dir, cmd_name)
+            with open(wrapper, "w") as w:
+                w.write("#!/bin/sh\n")
+                w.write('dir="$(cd "$(dirname "$0")" && pwd)"\n')
+                w.write(f'exec node "$dir/{rel_from_bin}" "$@"\n')
+            os.chmod(wrapper, 0o755)
+        if bin_map:
+            return
+
+    # --- CMake ---
+    if os.path.isfile(os.path.join(source_dir, "CMakeLists.txt")):
+        build_d = os.path.join(source_dir, "build")
+        ensure_dir(build_d)
+        run_cmd("cmake -DCMAKE_INSTALL_PREFIX=../install-root -DCMAKE_BUILD_TYPE=Release ..", cwd=build_d, env=env, check=True)
+        run_cmd("cmake --build . --target install", cwd=build_d, env=env, check=True)
+        prefix = os.path.join(source_dir, "install-root")
+        for sub in ("bin", "libexec", "lib"):
+            src_bin = os.path.join(prefix, sub)
+            if os.path.isdir(src_bin):
+                for exe in os.listdir(src_bin):
+                    p = os.path.join(src_bin, exe)
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        shutil.copy2(p, os.path.join(bin_dir, exe))
+        return
+
+    # --- Meson ---
+    if os.path.isfile(os.path.join(source_dir, "meson.build")):
+        build_d = os.path.join(source_dir, "build")
+        ensure_dir(build_d)
+        run_cmd("meson setup build -Dprefix=../install-root -Dbuildtype=release", cwd=source_dir, env=env, check=True)
+        run_cmd("meson compile -C build", cwd=source_dir, env=env, check=True)
+        run_cmd("meson install -C build", cwd=source_dir, env=env, check=True)
+        prefix = os.path.join(source_dir, "install-root")
+        for sub in ("bin", "libexec"):
+            src_bin = os.path.join(prefix, sub)
+            if os.path.isdir(src_bin):
+                for exe in os.listdir(src_bin):
+                    p = os.path.join(src_bin, exe)
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        shutil.copy2(p, os.path.join(bin_dir, exe))
+        return
+
+    # --- Makefile ---
     if os.path.isfile(os.path.join(source_dir, "Makefile")):
         prefix = os.path.join(source_dir, "install-root")
         ensure_dir(prefix)
         run_cmd(f"make PREFIX={prefix} install", cwd=source_dir, env=env, check=True)
-        # Copy install-root/bin/* to store_path/bin
         src_bin = os.path.join(prefix, "bin")
         if os.path.isdir(src_bin):
             for exe in os.listdir(src_bin):
-                shutil.copy2(
-                    os.path.join(src_bin, exe),
-                    os.path.join(bin_dir, exe),
-                )
+                shutil.copy2(os.path.join(src_bin, exe), os.path.join(bin_dir, exe))
         return
 
+    # --- Ruby (Gemfile) ---
+    if os.path.isfile(os.path.join(source_dir, "Gemfile")):
+        run_cmd("bundle config set --local path vendor/bundle", cwd=source_dir, env=env, check=True)
+        run_cmd("bundle install", cwd=source_dir, env=env, check=True)
+        exe_dir = os.path.join(source_dir, "exe")
+        if os.path.isdir(exe_dir):
+            for exe in os.listdir(exe_dir):
+                p = os.path.join(exe_dir, exe)
+                if os.path.isfile(p):
+                    shutil.copy2(p, os.path.join(bin_dir, exe))
+                    os.chmod(os.path.join(bin_dir, exe), 0o755)
+        return
+
+    # --- Gradle (Java/Kotlin) ---
+    if os.path.isfile(os.path.join(source_dir, "build.gradle")) or os.path.isfile(os.path.join(source_dir, "build.gradle.kts")):
+        run_cmd("./gradlew installDist", cwd=source_dir, env=env, check=True)
+        for d in ("build/install", "build/install/main"):
+            inst = os.path.join(source_dir, d, "bin")
+            if os.path.isdir(inst):
+                for exe in os.listdir(inst):
+                    p = os.path.join(inst, exe)
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        shutil.copy2(p, os.path.join(bin_dir, exe))
+                return
+
+    # --- Maven (Java) ---
+    if os.path.isfile(os.path.join(source_dir, "pom.xml")):
+        run_cmd("mvn -q package -DskipTests", cwd=source_dir, env=env, check=True)
+        jar_path = None
+        for root, _dirs, files in os.walk(os.path.join(source_dir, "target")):
+            for f in files:
+                if f.endswith(".jar") and "original" not in root and "-sources" not in f:
+                    p = os.path.join(root, f)
+                    if "-with-dependencies" in f:
+                        jar_path = p
+                        break
+                    if not jar_path:
+                        jar_path = p
+            if jar_path:
+                break
+        if jar_path:
+            ensure_dir(os.path.join(store_path, "lib"))
+            jar_name = os.path.basename(jar_path)
+            shutil.copy2(jar_path, os.path.join(store_path, "lib", jar_name))
+            wrapper = os.path.join(bin_dir, repo_name)
+            with open(wrapper, "w") as w:
+                w.write("#!/bin/sh\nexec java -jar \"$(dirname \"$0\")/../lib/" + jar_name + "\" \"$@\"\n")
+            os.chmod(wrapper, 0o755)
+        return
+
+    # --- Just (justfile) ---
+    if os.path.isfile(os.path.join(source_dir, "justfile")) or os.path.isfile(os.path.join(source_dir, "Justfile")):
+        run_cmd("just --list", cwd=source_dir, env=env, check=True)
+        run_cmd("just build", cwd=source_dir, env=env, check=False)
+        for sub in ("target/release", "build", "bin", "."):
+            d = os.path.join(source_dir, sub)
+            if os.path.isdir(d):
+                for f in os.listdir(d):
+                    p = os.path.join(d, f)
+                    if os.path.isfile(p) and os.access(p, os.X_OK) and not f.startswith("."):
+                        shutil.copy2(p, os.path.join(bin_dir, f))
+                        return
+        logger("Just build did not produce an executable in expected locations", "WARNING")
+
+    # --- Python ---
     if os.path.isfile(os.path.join(source_dir, "setup.py")) or os.path.isfile(
         os.path.join(source_dir, "pyproject.toml")
     ):
@@ -466,7 +748,7 @@ def _adhoc_build_and_install(
                     shutil.copy2(os.path.join(root, f), os.path.join(bin_dir, f))
         return
 
-    logger("No Cargo.toml, Makefile, setup.py, go.mod found; copying repo as-is", "WARNING")
+    logger("No known build system detected (Cargo, Go, Node, CMake, Meson, Make, Ruby, Gradle, Maven, Just, Python); copying executables from root", "WARNING")
     # Fallback: copy any executable in root
     for f in os.listdir(source_dir):
         p = os.path.join(source_dir, f)
@@ -918,6 +1200,15 @@ class Transaction:
         _print_path_hint()
 
     def uninstall(self, package_names):
+        cfg = DeclarativeConfig()
+        for name in package_names:
+            removed_spec = cfg.remove_by_name(name)
+            if removed_spec and removed_spec.startswith("distro:"):
+                parts = removed_spec[7:].strip().split(":", 1)
+                if len(parts) == 2:
+                    pm_key, pkg_name = parts[0].strip(), parts[1].strip()
+                    distro_remove(pm_key, pkg_name)
+                    logger(f"Removed {pkg_name} via {pm_key}")
         current_gen, current_pkgs = self.profile.current_generation()
         store = self.store
         to_remove = set()
@@ -933,9 +1224,6 @@ class Transaction:
         new_pkgs = [p for p in current_pkgs if p not in to_remove]
         if new_pkgs != current_pkgs:
             self.profile.add_generation(new_pkgs)
-            cfg = DeclarativeConfig()
-            for name in package_names:
-                cfg.remove_by_name(name)
             logger(f"Uninstalled {', '.join(package_names)}. New generation created.")
         else:
             logger("No packages removed.")
@@ -979,20 +1267,23 @@ def _print_path_hint() -> None:
 
 # ==================== Sync / Apply / Status / Backup (pdrx-style) ====================
 def cmd_sync() -> None:
-    """Write current profile state to declarative packages.conf."""
+    """Write current profile state to declarative packages.conf (preserves distro: entries)."""
+    cfg = DeclarativeConfig()
+    existing = cfg.read_entries()
+    distro_specs = [e[0] for e in existing if e[0].startswith("distro:")]
     profile = Profile()
     gen, store_ids = profile.current_generation()
     store = Store()
-    specs = []
+    store_specs = []
     for sid in store_ids:
         row = store.db.get_store_package(sid)
         if row:
             spec = row[4] if len(row) > 4 else ""
             if not spec:
                 spec = f"recipe:{row[1]}@{row[2]}"
-            specs.append(spec)
-    DeclarativeConfig().write_entries(specs)
-    logger(f"Synced generation {gen} ({len(specs)} packages) to {PACKAGES_CONF}")
+            store_specs.append(spec)
+    cfg.write_entries(distro_specs + store_specs)
+    logger(f"Synced generation {gen} ({len(distro_specs)} distro + {len(store_specs)} store) to {PACKAGES_CONF}")
 
 
 def cmd_apply(use_sandbox: bool = True, cache_url: Optional[str] = None) -> None:
@@ -1003,15 +1294,25 @@ def cmd_apply(use_sandbox: bool = True, cache_url: Optional[str] = None) -> None
         logger("No packages in config. Add with pygr install or edit packages.conf.")
         return
     trans = Transaction(use_sandbox=use_sandbox, cache_url=cache_url)
+    distro_specs = []
     github_specs = []
     recipe_specs = []
     for s in specs:
-        if s.startswith("github:"):
+        if s.startswith("distro:"):
+            distro_specs.append(s)
+        elif s.startswith("github:"):
             github_specs.append(s)
         elif s.startswith("recipe:"):
             recipe_specs.append(s)
+    for spec in distro_specs:
+        # distro:apt:ripgrep
+        parts = spec[7:].strip().split(":", 1)
+        if len(parts) == 2:
+            _pm, name = parts
+            if distro_install(_pm.strip(), name.strip()):
+                logger(f"Installed {name} via {_pm}")
     for spec in github_specs:
-        part = spec[7:].strip()  # github:
+        part = spec[7:].strip()
         if "@" in part:
             repo_ref = part.split("@", 1)
             owner_repo = repo_ref[0].strip()
@@ -1126,15 +1427,20 @@ def main():
     search_p.add_argument("query", help="Search query (e.g. ripgrep, cowsay)")
     search_p.add_argument("-n", "--num", type=int, default=10, help="Max results (default 10)")
 
-    # install (recipe name or owner/repo)
+    # install (name -> try distro, then recipe, then GitHub; or owner/repo -> GitHub)
     install = subparsers.add_parser(
         "install",
-        help="Install packages (recipe name or owner/repo from GitHub)",
+        help="Install: try distro package first, then recipe, then build from GitHub",
     )
     install.add_argument(
         "packages",
         nargs="+",
-        help="Recipe name(s) or owner/repo (e.g. BurntSushi/ripgrep)",
+        help="Package name(s) or owner/repo (e.g. ripgrep or BurntSushi/ripgrep)",
+    )
+    install.add_argument(
+        "--from-github",
+        action="store_true",
+        help="Skip distro/recipe; install from GitHub only (by name search or owner/repo)",
     )
 
     # list
@@ -1210,24 +1516,38 @@ def main():
     elif args.command == "install":
         trans = Transaction(use_sandbox=args.sandbox, cache_url=cache_url)
         github_pkgs = [p for p in args.packages if "/" in p.split("@")[0]]
-        recipe_pkgs = [p for p in args.packages if p not in github_pkgs]
+        simple_pkgs = [p for p in args.packages if p not in github_pkgs]
         for p in github_pkgs:
             install_from_github(p, use_sandbox=args.sandbox, cache_url=cache_url)
-        if recipe_pkgs:
-            trans.install(recipe_pkgs)
+        for p in simple_pkgs:
+            if args.from_github:
+                _install_simple_name_from_github(p, use_sandbox=args.sandbox, cache_url=cache_url)
+                continue
+            spec = try_install_from_distro(p)
+            if spec:
+                DeclarativeConfig().add_entry(spec)
+                continue
+            try:
+                trans.install([p])
+            except Exception as e:
+                if "No recipe found" in str(e) or "No version" in str(e):
+                    _install_simple_name_from_github(p, use_sandbox=args.sandbox, cache_url=cache_url)
+                else:
+                    raise
+        if args.packages:
+            _print_path_hint()
     elif args.command == "list":
+        cfg = DeclarativeConfig()
+        entries = cfg.read_entries()
+        if not entries:
+            print("No packages in config.")
+            return
         profile = Profile()
         gen, pkgs = profile.current_generation()
-        if not pkgs:
-            print("No packages installed.")
-            return
-        store = Store()
-        print(f"Profile generation {gen}:")
-        for store_id in pkgs:
-            path = store.get_package_path(store_id)
-            if path:
-                name_ver = os.path.basename(path).split("-", 1)[1]
-                print(f"  {name_ver}")
+        print(f"Packages ({len(entries)} in config, {len(pkgs)} in profile gen {gen}):")
+        for spec, display_name in entries:
+            kind = " (distro)" if spec.startswith("distro:") else ""
+            print(f"  {display_name}{kind}")
     elif args.command == "path":
         bin_dir = _profile_bin_dir()
         print(f"export PATH=\"{bin_dir}:$PATH\"")
