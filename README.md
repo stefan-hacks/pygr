@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon_pygr.jpeg" width="96" alt="pygr" />
+  <img src="icon_pygr.png" width="192" alt="pygr" />
 </p>
 
 # pygr — Python GitHub Repository package manager
