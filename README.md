@@ -124,148 +124,20 @@ After installing tools built from GitHub/recipes, add the profile bin to your PA
 
 ---
 
-#### `pygr uninstall PACKAGE [PACKAGE ...]`
+## Distribution
 
-Remove packages and drop them from the declarative config. Uses the recorded method (distro PM or store).
+Install pygr’s dependencies with your package manager, then run `pygr.py` (or use the [bootstrap](#bootstrap-installation) which uses a venv and does not need system Python packages).
 
-```bash
-pygr uninstall ripgrep cowsay
-```
+| Distribution | Install command |
+|--------------|-----------------|
+| **Debian / Ubuntu** | `sudo apt update && sudo apt install -y python3 python3-pip git firejail python3-yaml python3-git python3-requests python3-packaging` |
+| **Fedora / RHEL / CentOS** | `sudo dnf install -y python3 python3-pip git firejail python3-pyyaml python3-GitPython python3-requests python3-packaging` |
+| **Arch Linux** | `sudo pacman -S --needed python python-pip git firejail python-yaml python-gitpython python-requests python-packaging` |
+| **openSUSE (Tumbleweed / Leap)** | `sudo zypper install -y python3 python3-pip git firejail python3-PyYAML python3-GitPython python3-requests python3-packaging` |
+| **Alpine Linux** | `sudo apk add python3 py3-pip git firejail py3-yaml py3-git py3-requests py3-packaging` |
 
----
-
-#### `pygr list`
-
-List all packages in the declarative config. Distro-installed ones are marked `(distro)`.
-
-```bash
-pygr list
-```
-
----
-
-#### `pygr path`
-
-Print the shell command to add the profile `bin` directory to `PATH`. Use with `eval` to apply in the current shell.
-
-```bash
-eval $(pygr path)
-pygr path    # shows: export PATH=".../profiles/default/bin:$PATH"
-```
-
----
-
-#### `pygr sync`
-
-Write the current profile (store packages) into the declarative config. Keeps existing `distro:` lines.
-
-```bash
-pygr sync
-```
-
----
-
-#### `pygr apply`
-
-Install every package in the declarative config (distro, GitHub, and recipe entries). Use to restore a setup (e.g. on a new machine after copying config).
-
-```bash
-pygr apply
-```
-
----
-
-#### `pygr status`
-
-Show config path, number of packages in config and in current profile, and number of backups.
-
-```bash
-pygr status
-```
-
----
-
-#### `pygr backup [LABEL]`
-
-Create a timestamped backup of the config directory. Optional **LABEL** is appended to the backup name.
-
-```bash
-pygr backup
-pygr backup before-upgrade
-```
-
----
-
-#### `pygr generations`
-
-List profile generations and backup directories (oldest to newest; current at bottom).
-
-```bash
-pygr generations
-```
-
----
-
-#### `pygr rollback`
-
-Switch the profile to the previous generation (undo last install/upgrade).
-
-```bash
-pygr rollback
-```
-
----
-
-#### `pygr export [FILE]`
-
-Export the config directory to a tarball. Default filename is `pygr-export-YYYYMMDD_HHMMSS.tar.gz` if **FILE** is omitted.
-
-```bash
-pygr export
-pygr export my-config.tar.gz
-```
-
----
-
-#### `pygr import FILE`
-
-Extract a config tarball into the pygr root, then run `pygr apply` to install everything.
-
-```bash
-pygr import my-config.tar.gz
-pygr apply
-```
-
----
-
-#### `pygr upgrade [PACKAGE ...]`
-
-Reinstall packages to upgrade them. If no names are given, upgrade all installed (store) packages.
-
-```bash
-pygr upgrade cowsay
-pygr upgrade
-```
-
----
-
-#### `pygr repo-add NAME URL`
-
-Add a recipe repository (Git repo containing YAML recipes).
-
-```bash
-pygr repo-add myrecipes https://github.com/me/my-pygr-recipes
-```
-
----
-
-#### `pygr repo-list`
-
-List added recipe repositories.
-
-```bash
-pygr repo-list
-```
+Optional: omit **firejail** if you do not want build sandboxing (use `pygr --no-sandbox` when building).  
+If a distro does not package GitPython or others, use the [bootstrap](#bootstrap-installation) or a virtual environment and `pip install -r requirements.txt`.
 
 ---
 
